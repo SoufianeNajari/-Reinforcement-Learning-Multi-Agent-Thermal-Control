@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Data & AI (Très important !)
+models/
+results/
+*.zip
+*.csv
+
+# IDE
+.vscode/
+.idea/
