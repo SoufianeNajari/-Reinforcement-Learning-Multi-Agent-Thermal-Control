@@ -12,38 +12,49 @@ class BuildingEnv(ParallelEnv):
         "render_modes": [None]
     }
 
-    def __init__(self, nb_zones=3, render_mode=None):
+    def __init__(self, building_config, render_mode=None):
+        # 1. Gestion du rendu (Standard PettingZoo)
         self.render_mode = render_mode
-        self.possible_agents = [f"zone_{i}" for i in range(nb_zones)]
         
-        # Consigne de température cible
+        # 2. Initialisation du modèle physique avec unpacking
+        self.model = ThermalModel(**building_config)
+        
+        # 3. Configuration des agents
+        self.possible_agents = [f"zone_{i}" for i in range(self.model.nb_zones)]
+        
+        # 4. Paramètres de simulation
         self.target_temp = 21.0
-        
-        # Modèle physique RC
-        self.model = ThermalModel(
-            nb_zones=nb_zones,
-            start_temp=19.0,
-            R_val=0.1,         # Isolation
-            C_val=1e6,         # Inertie (1 000 000 J/K)
-            R_inter=0.5,       # Échanges entre zones
-            max_power=2000,    # Puissance PAC
-            dt=60              # 1 minute par pas
-        )
-        
-        self.t_ext = self.model.t_ext  # Température extérieure par défaut
-
-        # Compteur interne pour limiter la durée des épisodes
         self.current_step = 0
-
+        self.default_t_ext = 5.0
+    
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent):
         # [Température zone, Température extérieure]
-        return spaces.Box(low=0, high=50, shape=(2,), dtype=np.float32)
+        return spaces.Box(low=-20, high=120, shape=(4,), dtype=np.float32)
 
     @functools.lru_cache(maxsize=None)
     def action_space(self, agent):
         # Action continue entre -1 (froid) et 1 (chaud)
         return spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
+
+
+    def _get_obs(self, temps, base_t_ext):
+        observations = {}
+        for i, agent in enumerate(self.possible_agents):
+            idx_voisins = np.where(self.model.adj[i] == 1)[0]
+            nb_v = len(idx_voisins)
+            sum_v_temp = np.sum(temps[idx_voisins]) if nb_v > 0 else 0.0
+            
+            t_ext_zone = base_t_ext + self.model.t_ext_offset[i]
+            
+            observations[agent] = np.array([
+                temps[i],
+                t_ext_zone,
+                sum_v_temp,
+                float(nb_v)
+            ], dtype=np.float32)
+        return observations
+
 
     def reset(self, seed=None, options=None):
         # Réinitialisation PettingZoo
@@ -54,19 +65,13 @@ class BuildingEnv(ParallelEnv):
         temps = self.model.reset()
         
         # Gestion de t_ext au démarrage
-        t_ext = self.t_ext
-        if options and "t_ext" in options:
-            t_ext = options["t_ext"]
-            
-        observations = {
-            agent: np.array([temps[i], t_ext], dtype=np.float32) for i, agent in enumerate(self.agents)
-        }
-        return observations, {}
+        t_ext = options.get("t_ext", self.default_t_ext) if options else self.default_t_ext
+        return self._get_obs(temps, t_ext), {}
 
     def step(self, actions, t_ext=None):
         # Sécurité si t_ext n'est pas fourni par l'IA (Training)
         if t_ext is None:
-            t_ext = self.t_ext
+            t_ext = self.default_t_ext
             
         self.current_step += 1
         
@@ -75,17 +80,15 @@ class BuildingEnv(ParallelEnv):
         new_temps = self.model.step(act_array, t_ext)
         
         # 2. Préparation des observations
-        observations = {
-            agent: np.array([new_temps[i], t_ext], dtype=np.float32) 
-            for i, agent in enumerate(self.agents)
-        }
+        observations = self._get_obs(new_temps, t_ext)
         
         # 3. Calcul de la récompense (Reward)
         rewards = {}
         for i, agent in enumerate(self.agents):
-            # Plus on est loin de 21°C, plus le score est mauvais
             error = abs(new_temps[i] - self.target_temp)
-            rewards[agent] = -(error **2)
+            l1_loss = error
+            l2_loss = error ** 2
+            rewards[agent] = -float((0.5 * l1_loss + 0.5 * l2_loss) / 10.0)
 
         # 4. Conditions d'arrêt (Truncation après 24h)
         # Indispensable pour que SB3 affiche 'ep_rew_mean'
